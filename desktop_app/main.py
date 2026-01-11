@@ -2,9 +2,15 @@
 """
 AI Physical Desk Assistant - Desktop Control Application
 Phase 1: Full servo control with GUI sliders and idle animations
+
+COMMUNICATION ARCHITECTURE:
+- Simple request-response pattern (no async telemetry confusion)
+- Explicit ACK/NACK for every command
+- Separate telemetry polling on timer
+- Robust frame synchronization with length prefix validation
 """
 
-import json
+import cbor2
 import serial
 import serial.tools.list_ports
 import time
@@ -14,7 +20,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 from typing import Optional, Dict, Any, List
 import queue
-
+import struct
 
 class ArmController:
     """Handles communication with the ESP32 robot arm controller."""
@@ -27,7 +33,7 @@ class ArmController:
         self.telemetry_callback = telemetry_callback
         self.running = False
         self.telemetry_thread: Optional[threading.Thread] = None
-        self.telemetry_queue = queue.Queue()
+        self.serial_lock = threading.Lock()  # Protect serial access
 
     def log(self, message: str):
         """Log message to GUI if callback provided."""
@@ -41,7 +47,7 @@ class ArmController:
         ports = serial.tools.list_ports.comports()
         for port in ports:
             # Look for ESP32 or common USB serial devices
-            if any(keyword in port.description.upper() for keyword in ['ESP32', 'CP210', 'CH340', 'FTDI']):
+            if any(keyword in port.description.upper() for keyword in ['ESP32', 'CP210', 'CH340', 'FTDI', 'USB-SERIAL']):
                 return port.device
         return None
 
@@ -55,13 +61,19 @@ class ArmController:
                 return False
 
         try:
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=1)
+            self.serial = serial.Serial(self.port, self.baudrate, timeout=0.5)
             time.sleep(2)  # Wait for ESP32 to initialize
+            
+            # Clear any startup messages
+            while self.serial.in_waiting > 0:
+                self.serial.read(self.serial.in_waiting)
+                time.sleep(0.1)
+            
             self.log(f"✓ Connected to {self.port}")
 
-            # Start telemetry reading thread
+            # Start telemetry polling thread
             self.running = True
-            self.telemetry_thread = threading.Thread(target=self._read_telemetry_loop, daemon=True)
+            self.telemetry_thread = threading.Thread(target=self._telemetry_poll_loop, daemon=True)
             self.telemetry_thread.start()
 
             return True
@@ -73,83 +85,152 @@ class ArmController:
         """Close serial connection."""
         self.running = False
         if self.telemetry_thread:
-            self.telemetry_thread.join(timeout=1.0)
+            self.telemetry_thread.join(timeout=2.0)
 
         if self.serial and self.serial.is_open:
             self.serial.close()
             self.log("Disconnected")
 
+    def _send_cbor_message(self, cbor_data: bytes) -> bool:
+        """Send length-prefixed CBOR message (internal helper)."""
+        try:
+            message_length = len(cbor_data)
+            if message_length > 65535:  # Max uint16
+                self.log(f"✗ Message too large: {message_length} bytes")
+                return False
+            
+            # Create length-prefixed message (2-byte big-endian length + CBOR data)
+            length_prefix = struct.pack('>H', message_length)
+            message = length_prefix + cbor_data
+            
+            # Send with lock protection
+            with self.serial_lock:
+                self.serial.write(message)
+                self.serial.flush()
+            
+            return True
+        except Exception as e:
+            self.log(f"✗ Send error: {e}")
+            return False
+
+    def _receive_cbor_message(self, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+        """Receive length-prefixed CBOR message (internal helper)."""
+        try:
+            start_time = time.time()
+            
+            # Read length prefix (2 bytes)
+            with self.serial_lock:
+                while self.serial.in_waiting < 2 and time.time() - start_time < timeout:
+                    time.sleep(0.01)
+                
+                if self.serial.in_waiting < 2:
+                    return None
+                
+                length_bytes = self.serial.read(2)
+                if len(length_bytes) != 2:
+                    return None
+                
+                response_length = struct.unpack('>H', length_bytes)[0]
+                
+                # Validate length
+                if response_length == 0 or response_length > 65535:
+                    self.log(f"✗ Invalid message length: {response_length}")
+                    return None
+                
+                # Read CBOR message
+                start_read = time.time()
+                while self.serial.in_waiting < response_length and time.time() - start_read < timeout:
+                    time.sleep(0.01)
+                
+                if self.serial.in_waiting < response_length:
+                    self.log(f"✗ Timeout: expected {response_length} bytes, got {self.serial.in_waiting}")
+                    return None
+                
+                cbor_response = self.serial.read(response_length)
+            
+            # Decode CBOR
+            if len(cbor_response) != response_length:
+                self.log(f"✗ Read mismatch: expected {response_length}, got {len(cbor_response)}")
+                return None
+            
+            response = cbor2.loads(cbor_response)
+            return response
+            
+        except Exception as e:
+            self.log(f"✗ Receive error: {e}")
+            return None
+
     def send_command(self, command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Send a JSON command to ESP32 and wait for response."""
+        """Send a CBOR command to ESP32 and wait for response."""
         if not self.serial or not self.serial.is_open:
             self.log("✗ Not connected to ESP32")
             return None
 
         try:
+            # Encode command as CBOR
+            cbor_data = cbor2.dumps(command)
+            self.log(f"→ {command.get('cmd', 'unknown')}: {len(cbor_data)} bytes")
+            
             # Send command
-            message = json.dumps(command) + '\n'
-            self.serial.write(message.encode('utf-8'))
-            self.serial.flush()  # Ensure data is sent
-            self.log(f"→ {message.strip()}")
-
-            # Wait for response with timeout
-            start_time = time.time()
-            response_line = ""
-            while time.time() - start_time < 2.0:  # 2 second timeout
-                if self.serial.in_waiting > 0:
-                    char = self.serial.read().decode('utf-8')
-                    response_line += char
-                    if char == '\n':
-                        break
-                time.sleep(0.01)  # Small delay to prevent busy waiting
-
-            response_line = response_line.strip()
-            if response_line:
-                try:
-                    response = json.loads(response_line)
-                    # Check if this is a command response (not telemetry)
-                    if isinstance(response, dict) and "cmd" in response and response.get("type") != "telemetry":
-                        self.log(f"← {response_line}")
-                        return response
-                    else:
-                        # It's telemetry or something else, let the telemetry thread handle it
-                        self.log(f"← (telemetry: {response_line})")
-                        return {"status": "ok", "message": "command sent"}
-                except json.JSONDecodeError:
-                    self.log(f"✗ Invalid JSON response: '{response_line}'")
-                    return None
+            if not self._send_cbor_message(cbor_data):
+                return None
+            
+            # Wait for response
+            response = self._receive_cbor_message(timeout=2.0)
+            
+            if response:
+                # Log response (but not telemetry spam)
+                if response.get('type') != 'telemetry':
+                    self.log(f"← {response.get('cmd', 'response')}: {response.get('status', 'unknown')}")
+                return response
             else:
-                self.log("← (no response within 2 seconds)")
+                self.log(f"✗ No response for {command.get('cmd', 'unknown')}")
                 return None
 
         except Exception as e:
-            self.log(f"✗ Communication error: {e}")
+            self.log(f"✗ Command error: {e}")
             return None
 
-    def _read_telemetry_loop(self):
-        """Background thread to read telemetry messages."""
+    def _telemetry_poll_loop(self):
+        """Background thread to poll for telemetry updates."""
         while self.running and self.serial and self.serial.is_open:
             try:
-                if self.serial.in_waiting > 0:
-                    line = self.serial.readline().decode('utf-8').strip()
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            if self.telemetry_callback and data.get("type") == "telemetry" and "joints" in data:
-                                self.telemetry_callback(data)
-                        except json.JSONDecodeError:
-                            # Not valid JSON, skip
-                            pass
-                time.sleep(0.01)  # Small delay
+                # Request state update periodically
+                time.sleep(1.0)  # Poll every 1 second
+                
+                if not self.running:
+                    break
+                
+                # Send get_state command
+                cbor_data = cbor2.dumps({"cmd": "get_state"})
+                if self._send_cbor_message(cbor_data):
+                    response = self._receive_cbor_message(timeout=1.0)
+                    
+                    if response and self.telemetry_callback:
+                        # Convert to telemetry format
+                        if "state" in response and "joints" in response:
+                            telemetry = {
+                                "type": "telemetry",
+                                "state": response["state"],
+                                "joints": response["joints"]
+                            }
+                            self.telemetry_callback(telemetry)
+                
             except Exception as e:
                 if self.running:  # Only log if still running
-                    self.log(f"Telemetry read error: {e}")
-                break
+                    self.log(f"Telemetry error: {e}")
+                time.sleep(1.0)
 
     def ping(self) -> bool:
         """Test communication with ESP32."""
+        self.log("--- Sending Ping ---")
         response = self.send_command({"cmd": "ping"})
-        return response is not None and "state" in response
+        success = response is not None and "state" in response
+        if success:
+            self.log("✓ Ping successful")
+        else:
+            self.log("✗ Ping failed")
+        return success
 
     def get_state(self) -> Optional[Dict[str, Any]]:
         """Get current arm state from ESP32."""
@@ -163,7 +244,7 @@ class ArmController:
             "speed": speed
         }
         response = self.send_command(command)
-        return response is not None
+        return response is not None and response.get("status") == "ok"
 
     def play_idle(self, animation: str) -> bool:
         """Play idle animation."""
@@ -172,14 +253,13 @@ class ArmController:
             "name": animation
         }
         response = self.send_command(command)
-        return response is not None
+        return response is not None and response.get("status") == "ok"
 
     def emergency_stop(self) -> bool:
         """Emergency stop."""
         command = {"cmd": "estop"}
         response = self.send_command(command)
-        return response is not None
-
+        return response is not None and response.get("status") == "ok"
 
 class ArmControllerGUI:
     """Tkinter GUI for the Arm Controller."""
@@ -190,6 +270,7 @@ class ArmControllerGUI:
         self.root.geometry("900x700")
 
         self.controller = ArmController(log_callback=self.log_message, telemetry_callback=self.handle_telemetry)
+        self.connected = False
 
         # Joint names
         self.joint_names = ["Base", "Shoulder", "Elbow", "Wrist Pitch", "Wrist Roll", "Gripper"]
@@ -202,6 +283,7 @@ class ArmControllerGUI:
             (10, 90)     # Gripper
         ]
         self.current_angles = [90.0, 45.0, 120.0, 90.0, 0.0, 30.0]
+        self.updating_from_telemetry = False  # Flag to prevent feedback loop
 
         # Create GUI elements
         self.create_widgets()
@@ -342,12 +424,14 @@ class ArmControllerGUI:
         if "joints" in telemetry:
             joints = telemetry["joints"]
             if len(joints) == 6:
+                self.updating_from_telemetry = True  # Set flag
                 self.current_angles = joints[:]
                 # Update GUI labels
                 for i, angle in enumerate(joints):
                     self.current_labels[i].config(text=f"{angle:.1f}°")
                     # Update slider positions (but don't trigger send)
                     self.joint_scales[i].set(angle)
+                self.updating_from_telemetry = False  # Clear flag
 
         if "state" in telemetry:
             state = telemetry["state"]
@@ -366,13 +450,17 @@ class ArmControllerGUI:
 
     def on_joint_change(self, joint_index: int, value: str):
         """Handle joint slider change."""
+        # Don't send if we're updating from telemetry
+        if self.updating_from_telemetry:
+            return
+        
         try:
             angle = float(value)
             self.current_angles[joint_index] = angle
             self.current_labels[joint_index].config(text=f"{angle:.1f}°")
 
             # Send joint update to ESP32
-            if hasattr(self, 'connected') and self.connected:
+            if self.connected:
                 speed = self.speed_scale.get()
                 self.controller.set_joints(self.current_angles, speed)
         except ValueError:
@@ -381,12 +469,11 @@ class ArmControllerGUI:
     def connect_to_esp32(self):
         """Connect to ESP32."""
         selected_port = self.port_var.get()
-        if selected_port:
+        if selected_port and ' - ' in selected_port:
+            self.controller.port = selected_port.split(' - ')[0]
+        elif selected_port:
             self.controller.port = selected_port
-            self.log_message(f"Attempting to connect to ESP32 on {selected_port}...")
-        else:
-            self.log_message("Attempting to connect to ESP32 (auto-detect)...")
-
+        
         if self.controller.connect():
             self.status_label.config(text="Status: Connected", fg="green")
             self.connect_btn.config(text="Disconnect", command=self.disconnect_from_esp32)
@@ -421,29 +508,23 @@ class ArmControllerGUI:
 
     def send_ping(self):
         """Send ping command."""
-        self.log_message("--- Sending Ping ---")
-        success = self.controller.ping()
-        if success:
-            self.log_message("✓ Ping successful")
-        else:
-            self.log_message("✗ Ping failed")
+        self.controller.ping()
 
     def toggle_idle(self):
         """Toggle idle animations."""
         if "Enable" in self.idle_btn.cget("text"):
             # Switch to idle mode with breathing animation
-            self.controller.play_idle("breathing")
-            self.idle_btn.config(text="Disable Idle")
+            if self.controller.play_idle("breathing"):
+                self.idle_btn.config(text="Disable Idle")
         else:
             # Switch back to manual mode by setting current joint positions
-            self.controller.set_joints(self.current_angles, 0.5)
-            self.idle_btn.config(text="Enable Idle")
+            if self.controller.set_joints(self.current_angles, 0.5):
+                self.idle_btn.config(text="Enable Idle")
 
     def play_idle(self, animation: str):
         """Play specific idle animation."""
         self.log_message(f"--- Playing {animation} animation ---")
-        success = self.controller.play_idle(animation)
-        if success:
+        if self.controller.play_idle(animation):
             self.log_message(f"✓ Started {animation} animation")
         else:
             self.log_message(f"✗ Failed to start {animation} animation")
@@ -451,8 +532,7 @@ class ArmControllerGUI:
     def emergency_stop(self):
         """Emergency stop."""
         self.log_message("--- EMERGENCY STOP ---")
-        success = self.controller.emergency_stop()
-        if success:
+        if self.controller.emergency_stop():
             self.log_message("✓ Emergency stop activated")
         else:
             self.log_message("✗ Emergency stop failed")
@@ -465,15 +545,12 @@ class ArmControllerGUI:
         if port_list:
             # Auto-select first port
             self.port_combo.current(0)
-            self.port_var.set(port_list[0].split(' - ')[0])  # Set to just device name
-
 
 def main():
     """Main GUI application."""
     root = tk.Tk()
     app = ArmControllerGUI(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

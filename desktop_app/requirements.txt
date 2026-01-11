@@ -1,0 +1,10 @@
+# Python dependencies for AI Physical Desk Assistant - Desktop Control Application
+
+# Serial communication
+pyserial>=3.5
+
+# CBOR encoding/decoding
+cbor2>=5.4.6
+
+# GUI (built-in with Python, but listed for reference)
+# tkinter (standard library)
