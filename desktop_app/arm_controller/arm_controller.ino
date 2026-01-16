@@ -6,6 +6,7 @@
  * - CBOR communication protocol with length-prefix framing
  * - PCA9685 16-channel PWM servo controller via I2C
  * - Fixed buffer size calculation and frame synchronization
+ * - Test mode for single servo control (CH0)
  */
 
 #include <Wire.h>
@@ -56,13 +57,16 @@ float maxSpeeds[6] = {90.0, 90.0, 90.0, 90.0, 90.0, 90.0};      // Max degrees p
 float currentSpeed = 0.5;  // Global speed scaling (0.0-1.0)
 
 // System state
-enum State { STATE_IDLE, STATE_MANUAL, STATE_ESTOP };
+enum State { STATE_IDLE, STATE_MANUAL, STATE_ESTOP, STATE_TEST };
 State currentState = STATE_MANUAL;
 unsigned long lastUpdateTime = 0;
 unsigned long lastTelemetryTime = 0;
 unsigned long lastCommandTime = 0;
 #define TELEMETRY_INTERVAL_MS 500  // Send telemetry every 500ms (reduced frequency)
 #define COMMAND_TIMEOUT_MS 10000   // Disable servos if no command for 10 seconds
+
+// Test mode variables
+bool testMode = false;
 
 // Idle animation variables
 enum IdleAnimation { IDLE_NONE, IDLE_BREATHING, IDLE_CURIOUS_TILT, IDLE_MICRO_ADJUST, IDLE_RESET };
@@ -153,8 +157,8 @@ void loop() {
     lastUpdateTime = currentTime;
   }
 
-  // Send telemetry periodically (less frequent)
-  if (currentTime - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
+  // Send telemetry periodically (less frequent) - skip in test mode
+  if (!testMode && currentTime - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
     sendTelemetry();
     lastTelemetryTime = currentTime;
   }
@@ -289,6 +293,27 @@ void processCommand(uint8_t* data, uint16_t length) {
     } else {
       sendErrorResponse("Missing targets array");
     }
+  } else if (command == "set_test_servo") {
+    // Test mode: set single servo (channel 0) directly
+    if (hasTargets && targets[0] >= 0) {
+      float angle = clampAngle(0, targets[0]);
+      currentAngles[0] = angle;
+      targetAngles[0] = angle;
+      setServoAnglePCA(0, angle);
+      sendResponse("set_test_servo", "ok", "test_servo_set");
+    } else {
+      sendErrorResponse("Missing or invalid target angle");
+    }
+  } else if (command == "test_mode") {
+    // Enter test mode - disable telemetry
+    testMode = true;
+    currentState = STATE_TEST;
+    sendResponse("test_mode", "ok", "test_mode_enabled");
+  } else if (command == "exit_test_mode") {
+    // Exit test mode - re-enable telemetry
+    testMode = false;
+    currentState = STATE_MANUAL;
+    sendResponse("exit_test_mode", "ok", "test_mode_disabled");
   } else if (command == "play_idle") {
     if (idleName != "") {
       handlePlayIdle(idleName);
@@ -571,6 +596,7 @@ const char* getStateString() {
     case STATE_IDLE: return "idle";
     case STATE_MANUAL: return "manual";
     case STATE_ESTOP: return "estop";
+    case STATE_TEST: return "test";
     default: return "unknown";
   }
 }
