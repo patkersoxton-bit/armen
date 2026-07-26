@@ -20,7 +20,7 @@
 
 // PCA9685 settings
 #define PCA9685_ADDRESS 0x40
-#define SERVO_FREQ 50  // Analog servos run at ~50 Hz
+#define SERVO_FREQ 60  // Analog servos run at ~50 Hz
 #define SERVOMIN 150   // Minimum pulse length count (out of 4096)
 #define SERVOMAX 600   // Maximum pulse length count (out of 4096)
 
@@ -67,6 +67,7 @@ unsigned long lastCommandTime = 0;
 
 // Test mode variables
 bool testMode = false;
+int testChannel = 0;  // Which channel to test (0-5)
 
 // Idle animation variables
 enum IdleAnimation { IDLE_NONE, IDLE_BREATHING, IDLE_CURIOUS_TILT, IDLE_MICRO_ADJUST, IDLE_RESET };
@@ -203,6 +204,7 @@ void processCommand(uint8_t* data, uint16_t length) {
   bool hasTargets = false;
   float speed = -1.0;
   String idleName = "";
+  int channel = -1;
   
   // Parse key-value pairs
   while (!cbor_value_at_end(&element)) {
@@ -271,6 +273,12 @@ void processCommand(uint8_t* data, uint16_t length) {
       valueBuffer[valueLen] = '\0';
       idleName = String(valueBuffer);
     }
+    else if (key == "channel" && cbor_value_is_integer(&element)) {
+      int64_t val;
+      cbor_value_get_int64(&element, &val);
+      channel = (int)val;
+      cbor_value_advance(&element);
+    }
     else {
       // Skip unknown value
       cbor_value_advance(&element);
@@ -294,26 +302,39 @@ void processCommand(uint8_t* data, uint16_t length) {
       sendErrorResponse("Missing targets array");
     }
   } else if (command == "set_test_servo") {
-    // Test mode: set single servo (channel 0) directly
-    if (hasTargets && targets[0] >= 0) {
-      float angle = clampAngle(0, targets[0]);
-      currentAngles[0] = angle;
-      targetAngles[0] = angle;
-      setServoAnglePCA(0, angle);
-      sendResponse("set_test_servo", "ok", "test_servo_set");
+    // Test mode: set single servo directly
+    if (!testMode) {
+      sendErrorResponse("Not in test mode");
+    } else if (hasTargets && targets[0] >= 0) {
+      int ch = (channel >= 0 && channel <= 5) ? channel : testChannel;
+      float angle = clampAngle(ch, targets[0]);
+      currentAngles[ch] = angle;
+      targetAngles[ch] = angle;
+      setServoAnglePCA(ch, angle);
+      sendTestServoResponse(ch, angle);
     } else {
       sendErrorResponse("Missing or invalid target angle");
     }
+  } else if (command == "set_test_channel") {
+    // Change which channel is being tested
+    if (channel >= 0 && channel <= 5) {
+      testChannel = channel;
+      sendTestChannelResponse(testChannel);
+    } else {
+      sendErrorResponse("Invalid channel (must be 0-5)");
+    }
   } else if (command == "test_mode") {
-    // Enter test mode - disable telemetry
+    // Enter test mode - disable telemetry FIRST
     testMode = true;
     currentState = STATE_TEST;
+    delay(10);  // Brief delay to ensure telemetry loop sees the flag
     sendResponse("test_mode", "ok", "test_mode_enabled");
   } else if (command == "exit_test_mode") {
-    // Exit test mode - re-enable telemetry
+    // Exit test mode - send response BEFORE re-enabling telemetry
+    sendResponse("exit_test_mode", "ok", "test_mode_disabled");
+    delay(10);  // Brief delay to ensure response is sent
     testMode = false;
     currentState = STATE_MANUAL;
-    sendResponse("exit_test_mode", "ok", "test_mode_disabled");
   } else if (command == "play_idle") {
     if (idleName != "") {
       handlePlayIdle(idleName);
@@ -451,6 +472,59 @@ void sendTelemetry() {
     cbor_encode_float(&arrayEncoder, currentAngles[i]);
   }
   cbor_encoder_close_container(&mapEncoder, &arrayEncoder);
+  
+  cbor_encoder_close_container(&encoder, &mapEncoder);
+  
+  size_t actualLength = sizeof(buffer) - cbor_encoder_get_buffer_size(&encoder, buffer);
+  sendCBORMessage(buffer, actualLength);
+}
+
+void sendTestServoResponse(int channel, float angle) {
+  uint8_t buffer[256];
+  CborEncoder encoder, mapEncoder;
+  
+  cbor_encoder_init(&encoder, buffer, sizeof(buffer), 0);
+  cbor_encoder_create_map(&encoder, &mapEncoder, 4);
+  
+  cbor_encode_text_stringz(&mapEncoder, "cmd");
+  cbor_encode_text_stringz(&mapEncoder, "set_test_servo");
+  
+  cbor_encode_text_stringz(&mapEncoder, "status");
+  cbor_encode_text_stringz(&mapEncoder, "ok");
+  
+  cbor_encode_text_stringz(&mapEncoder, "channel");
+  cbor_encode_int(&mapEncoder, channel);
+  
+  cbor_encode_text_stringz(&mapEncoder, "angle");
+  cbor_encode_float(&mapEncoder, angle);
+  
+  cbor_encoder_close_container(&encoder, &mapEncoder);
+  
+  size_t actualLength = sizeof(buffer) - cbor_encoder_get_buffer_size(&encoder, buffer);
+  sendCBORMessage(buffer, actualLength);
+}
+
+void sendTestChannelResponse(int channel) {
+  uint8_t buffer[256];
+  CborEncoder encoder, mapEncoder;
+  
+  cbor_encoder_init(&encoder, buffer, sizeof(buffer), 0);
+  cbor_encoder_create_map(&encoder, &mapEncoder, 5);
+  
+  cbor_encode_text_stringz(&mapEncoder, "cmd");
+  cbor_encode_text_stringz(&mapEncoder, "set_test_channel");
+  
+  cbor_encode_text_stringz(&mapEncoder, "status");
+  cbor_encode_text_stringz(&mapEncoder, "ok");
+  
+  cbor_encode_text_stringz(&mapEncoder, "channel");
+  cbor_encode_int(&mapEncoder, channel);
+  
+  cbor_encode_text_stringz(&mapEncoder, "min");
+  cbor_encode_float(&mapEncoder, jointLimits[channel].min);
+  
+  cbor_encode_text_stringz(&mapEncoder, "max");
+  cbor_encode_float(&mapEncoder, jointLimits[channel].max);
   
   cbor_encoder_close_container(&encoder, &mapEncoder);
   

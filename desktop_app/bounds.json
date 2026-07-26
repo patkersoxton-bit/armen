@@ -1,0 +1,42 @@
+{
+  "note": "Step bounds relative to the reference (zero) pose. Only valid when the arm is zeroed at that same pose. min/max are raw motor steps; min_deg/max_deg are output-shaft degrees after applying gear_ratio.",
+  "steps_per_rev": 3200,
+  "axes": [
+    {
+      "axis": 0,
+      "name": "X (base)",
+      "gear_ratio": 37.0,
+      "min": -30529,
+      "max": 33300,
+      "min_deg": -92.82466216216217,
+      "max_deg": 101.25
+    },
+    {
+      "axis": 1,
+      "name": "Y (shoulder)",
+      "gear_ratio": 1.0,
+      "min": 0,
+      "max": 0,
+      "min_deg": 0.0,
+      "max_deg": 0.0
+    },
+    {
+      "axis": 2,
+      "name": "Z (elbow)",
+      "gear_ratio": 1.0,
+      "min": 0,
+      "max": 0,
+      "min_deg": 0.0,
+      "max_deg": 0.0
+    },
+    {
+      "axis": 3,
+      "name": "A (wrist)",
+      "gear_ratio": 1.0,
+      "min": 0,
+      "max": 0,
+      "min_deg": 0.0,
+      "max_deg": 0.0
+    }
+  ]
+}

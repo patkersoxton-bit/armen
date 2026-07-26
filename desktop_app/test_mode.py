@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-AI Physical Desk Assistant - Test Mode Application
-Simple single servo control for CH0 testing
+AI Physical Desk Assistant - Enhanced Test Mode Application
+Individual servo control for channels 0-5 with joint-specific limits
 """
 
 import cbor2
@@ -12,6 +12,16 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext
 from typing import Optional, Dict, Any
 import struct
+
+# Joint names and limits
+JOINT_INFO = {
+    0: {"name": "Base", "min": 0, "max": 180},
+    1: {"name": "Shoulder", "min": 15, "max": 165},
+    2: {"name": "Elbow", "min": 0, "max": 180},
+    3: {"name": "Wrist Pitch", "min": 30, "max": 150},
+    4: {"name": "Wrist Roll", "min": 0, "max": 180},
+    5: {"name": "Gripper", "min": 10, "max": 90}
+}
 
 class TestModeController:
     """Handles test mode communication with ESP32."""
@@ -141,14 +151,29 @@ class TestModeController:
             if not self._send_cbor_message(cbor_data):
                 return None
             
-            response = self._receive_cbor_message(timeout=2.0)
-            
-            if response:
-                self.log(f"← {response.get('cmd', 'response')}: {response.get('status', 'unknown')}")
+            # Wait for command response, skipping telemetry messages
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                response = self._receive_cbor_message(timeout=1.0)
+                
+                if not response:
+                    self.log(f"✗ No response (attempt {attempt + 1}/{max_attempts})")
+                    continue
+                
+                # Check if this is a telemetry message (skip it)
+                if response.get('type') == 'telemetry':
+                    self.log(f"← Telemetry (skipping): state={response.get('state')}")
+                    continue
+                
+                # This is a command response
+                self.log(f"← Response: {response}")
+                cmd = response.get('cmd', 'unknown')
+                status = response.get('status', 'unknown')
+                self.log(f"  cmd={cmd}, status={status}")
                 return response
-            else:
-                self.log(f"✗ No response")
-                return None
+            
+            self.log(f"✗ No command response received after {max_attempts} attempts")
+            return None
 
         except Exception as e:
             self.log(f"✗ Command error: {e}")
@@ -164,33 +189,43 @@ class TestModeController:
         response = self.send_command({"cmd": "exit_test_mode"})
         return response is not None and response.get("status") == "ok"
 
-    def set_test_servo(self, angle: float) -> bool:
-        """Set CH0 servo angle."""
+    def set_test_channel(self, channel: int) -> Optional[Dict[str, Any]]:
+        """Set which channel to test."""
+        command = {"cmd": "set_test_channel", "channel": channel}
+        return self.send_command(command)
+
+    def set_test_servo(self, angle: float, channel: Optional[int] = None) -> bool:
+        """Set servo angle for current or specified channel."""
         command = {
             "cmd": "set_test_servo",
-            "targets": [angle, 0, 0, 0, 0, 0]  # Only first value matters
+            "targets": [angle, 0, 0, 0, 0, 0]
         }
+        if channel is not None:
+            command["channel"] = channel
+        
         response = self.send_command(command)
         return response is not None and response.get("status") == "ok"
 
+
 class TestModeGUI:
-    """Simple GUI for test mode."""
+    """Enhanced GUI for test mode with channel selection."""
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Servo Test Mode - CH0 Only")
-        self.root.geometry("600x500")
+        self.root.title("Servo Test Mode - All Channels")
+        self.root.geometry("700x600")
 
         self.controller = TestModeController(log_callback=self.log_message)
         self.connected = False
         self.test_mode_active = False
+        self.current_channel = 0
 
         self.create_widgets()
 
     def create_widgets(self):
         """Create the GUI widgets."""
         # Title
-        title_label = tk.Label(self.root, text="Servo Test Mode (Channel 0)",
+        title_label = tk.Label(self.root, text="Enhanced Servo Test Mode",
                               font=("Arial", 16, "bold"))
         title_label.pack(pady=10)
 
@@ -211,28 +246,69 @@ class TestModeGUI:
         refresh_btn = tk.Button(port_frame, text="↻", command=self.refresh_ports, width=3)
         refresh_btn.pack(side=tk.LEFT)
 
+        # Channel selection frame
+        channel_frame = tk.LabelFrame(self.root, text="Channel Selection", padx=20, pady=10)
+        channel_frame.pack(pady=10, fill=tk.X, padx=20)
+
+        # Create channel buttons in a grid
+        button_frame = tk.Frame(channel_frame)
+        button_frame.pack()
+        
+        self.channel_buttons = []
+        for i in range(6):
+            info = JOINT_INFO[i]
+            btn = tk.Button(
+                button_frame,
+                text=f"CH{i}\n{info['name']}",
+                width=10,
+                height=3,
+                command=lambda ch=i: self.select_channel(ch)
+            )
+            btn.grid(row=i//3, column=i%3, padx=5, pady=5)
+            self.channel_buttons.append(btn)
+        
+        # Highlight initial channel
+        self.channel_buttons[0].config(relief=tk.SUNKEN, bg="lightblue")
+
         # Control frame
-        control_frame = tk.LabelFrame(self.root, text="CH0 Servo Control", padx=20, pady=20)
-        control_frame.pack(pady=20, fill=tk.X, padx=20)
+        control_frame = tk.LabelFrame(self.root, text="Servo Control", padx=20, pady=20)
+        control_frame.pack(pady=10, fill=tk.X, padx=20)
+
+        # Current channel display
+        self.channel_info_label = tk.Label(
+            control_frame,
+            text=f"CH{self.current_channel}: {JOINT_INFO[self.current_channel]['name']}",
+            font=("Arial", 14, "bold")
+        )
+        self.channel_info_label.pack(pady=5)
 
         # Servo angle display
         self.angle_label = tk.Label(control_frame, text="90.0°", font=("Arial", 24, "bold"))
         self.angle_label.pack(pady=10)
 
         # Slider
-        self.servo_scale = tk.Scale(control_frame, from_=0, to=180, resolution=0.5,
-                                   orient=tk.HORIZONTAL, length=400,
-                                   command=self.on_servo_change,
-                                   showvalue=False)
+        self.servo_scale = tk.Scale(
+            control_frame,
+            from_=0,
+            to=180,
+            resolution=0.5,
+            orient=tk.HORIZONTAL,
+            length=500,
+            command=self.on_servo_change,
+            showvalue=False
+        )
         self.servo_scale.set(90.0)
         self.servo_scale.pack(pady=10)
 
         # Limit labels
-        limit_frame = tk.Frame(control_frame)
-        limit_frame.pack()
-        tk.Label(limit_frame, text="0°").pack(side=tk.LEFT, padx=10)
-        tk.Label(limit_frame, text="90°").pack(side=tk.LEFT, padx=140)
-        tk.Label(limit_frame, text="180°").pack(side=tk.LEFT, padx=10)
+        self.limit_frame = tk.Frame(control_frame)
+        self.limit_frame.pack()
+        self.min_label = tk.Label(self.limit_frame, text="0°", fg="red")
+        self.min_label.pack(side=tk.LEFT, padx=10)
+        self.mid_label = tk.Label(self.limit_frame, text="90°")
+        self.mid_label.pack(side=tk.LEFT, padx=190)
+        self.max_label = tk.Label(self.limit_frame, text="180°", fg="red")
+        self.max_label.pack(side=tk.LEFT, padx=10)
 
         # Buttons
         button_frame = tk.Frame(self.root)
@@ -241,17 +317,79 @@ class TestModeGUI:
         self.connect_btn = tk.Button(button_frame, text="Connect", command=self.connect_to_esp32)
         self.connect_btn.pack(side=tk.LEFT, padx=5)
 
-        self.test_mode_btn = tk.Button(button_frame, text="Enter Test Mode",
-                                      command=self.toggle_test_mode, state=tk.DISABLED)
+        self.test_mode_btn = tk.Button(
+            button_frame,
+            text="Enter Test Mode",
+            command=self.toggle_test_mode,
+            state=tk.DISABLED
+        )
         self.test_mode_btn.pack(side=tk.LEFT, padx=5)
 
         # Log
         log_label = tk.Label(self.root, text="Communication Log:")
         log_label.pack(anchor=tk.W, padx=20)
 
-        self.log_text = scrolledtext.ScrolledText(self.root, height=10, wrap=tk.WORD)
+        self.log_text = scrolledtext.ScrolledText(self.root, height=8, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
         self.log_text.config(state=tk.DISABLED)
+
+    def select_channel(self, channel: int):
+        """Switch to a different channel."""
+        if not self.test_mode_active:
+            self.log_message("✗ Must be in test mode to select channels")
+            return
+        
+        # Update visual feedback
+        for i, btn in enumerate(self.channel_buttons):
+            if i == channel:
+                btn.config(relief=tk.SUNKEN, bg="lightblue")
+            else:
+                btn.config(relief=tk.RAISED, bg="SystemButtonFace")
+        
+        self.current_channel = channel
+        info = JOINT_INFO[channel]
+        
+        # Update labels
+        self.channel_info_label.config(text=f"CH{channel}: {info['name']}")
+        
+        # Update slider limits
+        self.servo_scale.config(from_=info['min'], to=info['max'])
+        mid_val = (info['min'] + info['max']) / 2
+        self.servo_scale.set(mid_val)
+        
+        # Update limit labels
+        self.min_label.config(text=f"{info['min']}°")
+        self.max_label.config(text=f"{info['max']}°")
+        self.mid_label.config(text=f"{mid_val:.0f}°")
+        
+        # Send command to ESP32
+        response = self.controller.set_test_channel(channel)
+        if response and response.get("status") == "ok":
+            self.log_message(f"✓ Switched to CH{channel}: {info['name']}")
+            # Update limits from ESP32 response if provided
+            if "min" in response and "max" in response:
+                self.log_message(f"  Limits: {response['min']}° - {response['max']}°")
+        else:
+            self.log_message(f"✗ Failed to switch to CH{channel}")
+
+    def update_limit_display(self):
+        """Update the limit labels for current channel."""
+        info = JOINT_INFO[self.current_channel]
+        mid_val = (info['min'] + info['max']) / 2
+        
+        # Adjust mid label position dynamically
+        range_val = info['max'] - info['min']
+        padding = int(190 * (range_val / 180.0))  # Scale padding based on range
+        
+        for widget in self.limit_frame.winfo_children():
+            widget.destroy()
+        
+        self.min_label = tk.Label(self.limit_frame, text=f"{info['min']}°", fg="red")
+        self.min_label.pack(side=tk.LEFT, padx=10)
+        self.mid_label = tk.Label(self.limit_frame, text=f"{mid_val:.0f}°")
+        self.mid_label.pack(side=tk.LEFT, padx=padding)
+        self.max_label = tk.Label(self.limit_frame, text=f"{info['max']}°", fg="red")
+        self.max_label.pack(side=tk.LEFT, padx=10)
 
     def log_message(self, message: str):
         """Add message to the log."""
@@ -311,6 +449,8 @@ class TestModeGUI:
                 self.test_mode_btn.config(text="Exit Test Mode")
                 self.status_label.config(text="Status: Test Mode Active", fg="blue")
                 self.log_message("✓ Test mode enabled - telemetry disabled")
+                # Initialize to channel 0
+                self.select_channel(0)
             else:
                 self.log_message("✗ Failed to enter test mode")
         else:
@@ -320,6 +460,11 @@ class TestModeGUI:
                 self.test_mode_btn.config(text="Enter Test Mode")
                 self.status_label.config(text="Status: Connected", fg="green")
                 self.log_message("✓ Test mode disabled - telemetry re-enabled")
+                
+                # Reset visual feedback
+                for btn in self.channel_buttons:
+                    btn.config(relief=tk.RAISED, bg="SystemButtonFace")
+                self.channel_buttons[0].config(relief=tk.SUNKEN, bg="lightblue")
             else:
                 self.log_message("✗ Failed to exit test mode")
 
@@ -331,11 +476,13 @@ class TestModeGUI:
         if port_list:
             self.port_combo.current(0)
 
+
 def main():
     """Main test mode application."""
     root = tk.Tk()
     app = TestModeGUI(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
