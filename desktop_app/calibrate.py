@@ -15,11 +15,12 @@ import tkinter as tk
 from tkinter import scrolledtext
 
 from stepper_link import (
-    StepperLink, LinkError, NUM_AXES, STEPS_PER_REV,
-    GEAR_RATIOS, MAX_JOG_STEPS, deg_per_step, steps_for_output_degrees, set_gear_ratio,
+    StepperLink, LinkError, NUM_AXES, STEPS_PER_REV, AXIS_TYPE,
+    GEAR_RATIOS, deg_per_step, steps_for_output_degrees, set_gear_ratio,
+    flip_gear_direction, max_jog_for_axis,
 )
 
-AXIS_NAMES = ["X (base)", "Y (shoulder)", "Z (elbow)", "A (wrist)"]
+AXIS_NAMES = ["X (base)", "Y (shoulder)", "Z (elbow)", "A (spare)"]
 
 # Jog sizes in OUTPUT-shaft degrees, not raw motor steps — so a click moves
 # the same real-world angle on every axis regardless of gearing. Converted
@@ -71,7 +72,9 @@ class CalibrateGUI:
                   command=lambda: self.cmd(self.link.estop)).pack(side=tk.LEFT, padx=4)
         self._btn(mode, "Reset E-Stop", lambda: self.cmd(self.link.reset))
 
-        motion = tk.LabelFrame(self.root, text="Motion tuning (motor-level: 1/16 microstep, 3200 steps/rev)")
+        motion = tk.LabelFrame(
+            self.root,
+            text="Motion tuning — X/Y steppers only (motor-level: 1/16 microstep, 3200 steps/rev)")
         motion.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(motion, text="Max speed (steps/s):").pack(side=tk.LEFT)
         self.speed_var = tk.StringVar(value="2400")
@@ -80,7 +83,8 @@ class CalibrateGUI:
         self.accel_var = tk.StringVar(value="7200")
         tk.Entry(motion, textvariable=self.accel_var, width=7).pack(side=tk.LEFT, padx=4)
         tk.Button(motion, text="Apply", command=self.apply_motion).pack(side=tk.LEFT, padx=10)
-        tk.Label(motion, text="Custom jog (raw motor steps):").pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(motion, text="Custom jog (raw units — steps for X/Y, servo units for Z/A):"
+                 ).pack(side=tk.LEFT, padx=(10, 0))
         self.custom_jog_var = tk.StringVar(value=str(STEPS_PER_REV))
         tk.Entry(motion, textvariable=self.custom_jog_var, width=7).pack(side=tk.LEFT, padx=2)
 
@@ -90,7 +94,9 @@ class CalibrateGUI:
         ratios.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(ratios, text="1. Jog 1 Motor Rev  2. measure how far the OUTPUT shaft actually "
                               "turned (degrees)  3. Compute From Measurement, or type a known ratio "
-                              "and Set.", anchor="w", justify=tk.LEFT, wraplength=760
+                              "and Set.  If the axis spins the wrong way, click Flip Dir (note: "
+                              "Compute From Measurement resets the sign, so re-flip after using it).",
+                 anchor="w", justify=tk.LEFT, wraplength=760
                  ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 4))
         self.ratio_vars = []
         self.measured_vars = []
@@ -98,7 +104,16 @@ class CalibrateGUI:
         for i, name in enumerate(AXIS_NAMES):
             r = i + 1
             tk.Label(ratios, text=name, width=12, anchor="w").grid(row=r, column=0, sticky="w")
-            rlabel = tk.Label(ratios, text=f"current: {GEAR_RATIOS[i]:g}:1", width=14, anchor="w")
+            if AXIS_TYPE[i] == "servo":
+                # No ratio to calibrate on a servo axis — its 0-1000 -> 0-240°
+                # mapping is fixed hardware, not something to jog/measure/set.
+                tk.Label(ratios, text="servo — fixed 0.24°/unit, no ratio to calibrate",
+                         anchor="w").grid(row=r, column=1, columnspan=7, sticky="w")
+                self.ratio_labels.append(None)
+                self.ratio_vars.append(None)
+                self.measured_vars.append(None)
+                continue
+            rlabel = tk.Label(ratios, text=self._ratio_label_text(i), width=18, anchor="w")
             rlabel.grid(row=r, column=1)
             self.ratio_labels.append(rlabel)
             tk.Button(ratios, text="Jog 1 Motor Rev", width=14,
@@ -108,14 +123,19 @@ class CalibrateGUI:
             self.ratio_vars.append(rv)
             tk.Button(ratios, text="Set", command=lambda a=i: self.set_ratio(a)
                       ).grid(row=r, column=4, padx=2)
-            tk.Label(ratios, text="measured output °:").grid(row=r, column=5, padx=(10, 2))
+            tk.Button(ratios, text="Flip Dir", command=lambda a=i: self.flip_ratio(a)
+                      ).grid(row=r, column=5, padx=2)
+            tk.Label(ratios, text="measured output °:").grid(row=r, column=6, padx=(10, 2))
             mv = tk.StringVar()
-            tk.Entry(ratios, textvariable=mv, width=7).grid(row=r, column=6, padx=2)
+            tk.Entry(ratios, textvariable=mv, width=7).grid(row=r, column=7, padx=2)
             self.measured_vars.append(mv)
             tk.Button(ratios, text="Compute From Measurement",
-                      command=lambda a=i: self.compute_ratio(a)).grid(row=r, column=7, padx=4)
+                      command=lambda a=i: self.compute_ratio(a)).grid(row=r, column=8, padx=4)
 
-        axes = tk.LabelFrame(self.root, text="Axes (positions in raw motor steps from reference pose)")
+        axes = tk.LabelFrame(
+            self.root,
+            text="Axes (raw protocol units — motor steps from reference pose for X/Y, "
+                 "absolute servo position 0-1000 for Z/A)")
         axes.pack(fill=tk.X, padx=10, pady=5)
 
         self.pos_labels = []
@@ -226,26 +246,40 @@ class CalibrateGUI:
         except ValueError:
             self.log("✗ custom jog must be a whole number of steps")
             return
-        if not 0 < abs(steps) <= MAX_JOG_STEPS:
-            self.log(f"✗ custom jog must be 1-{MAX_JOG_STEPS} steps")
+        ceiling = max_jog_for_axis(axis)
+        if not 0 < abs(steps) <= ceiling:
+            self.log(f"✗ custom jog must be 1-{ceiling} steps")
             return
         self.cmd(self.link.jog, axis, sign * abs(steps))
 
     def jog_deg(self, axis: int, degrees: float):
-        """Jog by a real-world output-shaft angle, converted to raw motor
-        steps using this axis's current gear ratio (read live, so an edit in
-        the Gear Ratios panel takes effect immediately)."""
+        """Jog by a real-world output-shaft angle, converted to this axis's
+        native protocol units: raw motor steps via its current gear ratio
+        (read live, so an edit in the Gear Ratios panel takes effect
+        immediately) for a stepper axis, or servo position units for a
+        servo axis."""
         steps = steps_for_output_degrees(axis, degrees)
-        steps = max(-MAX_JOG_STEPS, min(MAX_JOG_STEPS, steps))
+        ceiling = max_jog_for_axis(axis)
+        steps = max(-ceiling, min(ceiling, steps))
         self.cmd(self.link.jog, axis, steps)
 
     def jog_one_motor_rev(self, axis: int):
         """Jog exactly one MOTOR revolution, ignoring gear ratio entirely —
         for visually verifying/measuring how far the output shaft actually
-        turns, independent of whatever ratio is currently configured."""
+        turns, independent of whatever ratio is currently configured. On a
+        direct-drive axis (ratio 1.0) this also doubles as the STEPS_PER_REV
+        sanity check after a driver/microstep change: the shaft must turn
+        exactly 360°, or STEPS_PER_REV in stepper_link.py no longer matches
+        the driver's actual microstep setting."""
         self.cmd(self.link.jog, axis, STEPS_PER_REV)
         self.log(f"{AXIS_NAMES[axis]}: jogged 1 motor rev ({STEPS_PER_REV} steps). "
-                 f"Measure the OUTPUT shaft's rotation in degrees and enter it above.")
+                 f"Measure the OUTPUT shaft's rotation in degrees and enter it above "
+                 f"(on a direct-drive axis this should be exactly 360°).")
+
+    def _ratio_label_text(self, axis: int) -> str:
+        ratio = GEAR_RATIOS[axis]
+        suffix = " (reversed)" if ratio < 0 else ""
+        return f"current: {abs(ratio):g}:1{suffix}"
 
     def set_ratio(self, axis: int):
         try:
@@ -254,8 +288,15 @@ class CalibrateGUI:
         except ValueError as e:
             self.log(f"✗ {AXIS_NAMES[axis]}: {e}")
             return
-        self.ratio_labels[axis].config(text=f"current: {GEAR_RATIOS[axis]:g}:1")
+        self.ratio_labels[axis].config(text=self._ratio_label_text(axis))
         self.log(f"✓ {AXIS_NAMES[axis]}: gear ratio set to {ratio:g}:1 (saved to gear_ratios.json)")
+
+    def flip_ratio(self, axis: int):
+        flip_gear_direction(axis)
+        self.ratio_vars[axis].set(f"{GEAR_RATIOS[axis]:g}")
+        self.ratio_labels[axis].config(text=self._ratio_label_text(axis))
+        state = "reversed" if GEAR_RATIOS[axis] < 0 else "normal"
+        self.log(f"✓ {AXIS_NAMES[axis]}: direction flipped ({state}, saved to gear_ratios.json)")
 
     def compute_ratio(self, axis: int):
         try:
@@ -269,9 +310,10 @@ class CalibrateGUI:
         ratio = 360.0 / measured_deg
         set_gear_ratio(axis, ratio)
         self.ratio_vars[axis].set(f"{ratio:g}")
-        self.ratio_labels[axis].config(text=f"current: {GEAR_RATIOS[axis]:g}:1")
+        self.ratio_labels[axis].config(text=self._ratio_label_text(axis))
         self.log(f"✓ {AXIS_NAMES[axis]}: 1 motor rev moved the output {measured_deg:g}°, "
-                 f"so ratio = {ratio:g}:1 (saved)")
+                 f"so ratio = {ratio:g}:1 (saved). If this axis actually spins backward, "
+                 f"click Flip Dir too.")
 
     def apply_motion(self):
         try:
@@ -308,13 +350,16 @@ class CalibrateGUI:
             self.log(f"✗ {e}")
             return
         data = {
-            "note": "Step bounds relative to the reference (zero) pose. "
-                    "Only valid when the arm is zeroed at that same pose. "
-                    "min/max are raw motor steps; min_deg/max_deg are output-shaft "
-                    "degrees after applying gear_ratio.",
+            "note": "Bounds relative to the reference (zero) pose for stepper axes "
+                    "(X/Y); servo axes (Z/A) don't need a reference pose, their "
+                    "position is always absolute. min/max are raw protocol units — "
+                    "motor steps for a stepper axis, servo position units (0-1000) "
+                    "for a servo axis; min_deg/max_deg are output-shaft degrees "
+                    "(via gear_ratio for steppers, a fixed 0.24°/unit for servos).",
             "steps_per_rev": STEPS_PER_REV,
             "axes": [
-                {"axis": i, "name": AXIS_NAMES[i], "gear_ratio": GEAR_RATIOS[i],
+                {"axis": i, "name": AXIS_NAMES[i], "axis_type": AXIS_TYPE[i],
+                 "gear_ratio": GEAR_RATIOS[i] if AXIS_TYPE[i] == "stepper" else None,
                  "min": cal["min"][i], "max": cal["max"][i],
                  "min_deg": cal["min"][i] * deg_per_step(i),
                  "max_deg": cal["max"][i] * deg_per_step(i)}

@@ -21,16 +21,33 @@ from serial.tools import list_ports
 
 NUM_AXES = 4
 
+# Which control scheme each axis uses. X/Y are TMC2209 steppers; Z/A are
+# Hiwonder LX-16A bus servos (see firmware/stepper_controller/
+# stepper_controller.ino's AXIS_TYPE — keep the two in sync, same as
+# MAX_JOG_STEPS already has to be). Everything below that's stepper-specific
+# (STEPS_PER_REV, GEAR_RATIOS, MAX_JOG_STEPS) simply doesn't apply to a
+# servo axis — deg_per_step()/steps_for_output_degrees()/max_jog_for_axis()
+# are where that distinction actually gets made.
+AXIS_TYPE = ["stepper", "stepper", "servo", "servo"]  # X, Y, Z, A
+
 # Fixed hardware config: DRV8825 with one cap on M2 = 1/16 microstepping.
-# This is a motor-shaft constant and never changes with gearing.
+# This is a motor-shaft constant and never changes with gearing. Only
+# meaningful for stepper axes.
 STEPS_PER_REV = 3200
 DEG_PER_STEP = 360.0 / STEPS_PER_REV  # 0.1125° — only correct for direct-drive
-                                       # (ratio 1.0) axes; see deg_per_step().
+                                       # (ratio 1.0) stepper axes; see deg_per_step().
 
-# Firmware sanity ceiling for a single jog command (see MAX_JOG_STEPS in
-# stepper_controller.ino — keep these two in sync). Geared axes need far more
-# raw motor steps to cover the same real jog distance, so this is sized for
-# the largest ratio in GEAR_RATIOS, not for direct drive.
+# LX-16A servo axes: position is 0-1000, linearly mapped to a fixed 0-240°
+# range (no gearbox, no ratio to calibrate — this never changes).
+SERVO_UNITS_PER_REV = 1000
+SERVO_DEG_RANGE = 240.0
+SERVO_DEG_PER_UNIT = SERVO_DEG_RANGE / SERVO_UNITS_PER_REV  # 0.24°/unit
+
+# Firmware sanity ceiling for a single jog command on a STEPPER axis (see
+# MAX_JOG_STEPS in stepper_controller.ino — keep these two in sync). Geared
+# axes need far more raw motor steps to cover the same real jog distance, so
+# this is sized for the largest ratio in GEAR_RATIOS, not for direct drive.
+# Servo axes use their own, much smaller ceiling — see max_jog_for_axis().
 MAX_JOG_STEPS = 500_000
 
 # Per-axis output gearbox ratio (motor revolutions per one output-shaft
@@ -39,14 +56,19 @@ MAX_JOG_STEPS = 500_000
 # happens here on the PC side, and every raw step count sent over the wire
 # is derived from this ratio.
 #
-# The base (X) axis got a 37:1 gearbox added to stop it overloading the
-# stepper (it was carrying the whole arm's weight at direct drive). Verify
-# the ratio for real before trusting it: in calibrate.py, use "Jog 1 Motor
-# Rev" on an axis, measure how far the OUTPUT shaft actually rotated, and
-# either set the ratio directly or let "Compute From Measurement" derive it
-# (ratio = 360 / measured_degrees). Persisted to gear_ratios.json so
-# calibrate.py and arm_control.py always agree.
-DEFAULT_GEAR_RATIOS = [37.0, 1.0, 1.0, 1.0]  # X (base), Y, Z, A
+# The base (X) axis has an orbital gearbox to stop it overloading the
+# stepper (it was carrying the whole arm's weight at direct drive). It
+# started at 37:1 and has since been swapped for a metal 10:1 unit — this is
+# a replacement ratio, not a second stage. Verify the ratio for real before
+# trusting it: in calibrate.py, use "Jog 1 Motor Rev" on an axis, measure how
+# far the OUTPUT shaft actually rotated, and either set the ratio directly or
+# let "Compute From Measurement" derive it (ratio = 360 / measured_degrees).
+# Persisted to gear_ratios.json so calibrate.py and arm_control.py always
+# agree. A negative ratio is a valid, intentional value: same magnitude,
+# flipped sign, used as a software direction-flip (see set_gear_ratio /
+# flip_gear_direction) instead of rewiring or re-wiring a driver's coil pair
+# when a motor spins the "wrong" way after a driver swap.
+DEFAULT_GEAR_RATIOS = [10.0, 1.0, 1.0, 1.0]  # X (base), Y, Z, A
 GEAR_RATIOS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gear_ratios.json")
 
 
@@ -71,22 +93,45 @@ def save_gear_ratios() -> None:
 
 
 def set_gear_ratio(axis: int, ratio: float) -> None:
-    if ratio <= 0:
-        raise ValueError("gear ratio must be positive")
+    if ratio == 0:
+        raise ValueError("gear ratio must be nonzero")
     GEAR_RATIOS[axis] = ratio
     save_gear_ratios()
 
 
+def flip_gear_direction(axis: int) -> None:
+    """Negate this axis's gear ratio in place (same magnitude, opposite
+    sign), so every degree/step conversion for it reverses consistently.
+    Used to correct a motor spinning the "wrong" way after a driver swap
+    without touching wiring. Note "Compute From Measurement" always derives
+    a positive ratio from a magnitude, so it resets any flip — re-apply
+    afterward if needed."""
+    set_gear_ratio(axis, -GEAR_RATIOS[axis])
+
+
 def deg_per_step(axis: int) -> float:
-    """Output-shaft degrees per motor microstep on this axis, accounting for
-    its gearbox. Use this (not the flat DEG_PER_STEP) for any conversion
-    that touches a possibly-geared axis."""
+    """Output-shaft degrees per one raw protocol unit on this axis: a motor
+    microstep (accounting for gearing) on a stepper axis, or a fixed
+    0.24°/unit on a servo axis (no gearbox, no ratio, ever). Use this (not
+    the flat DEG_PER_STEP) for any conversion that touches an axis that
+    might be geared or might be a servo — which, on this rig, is all of
+    them."""
+    if AXIS_TYPE[axis] == "servo":
+        return SERVO_DEG_PER_UNIT
     return 360.0 / (STEPS_PER_REV * GEAR_RATIOS[axis])
 
 
 def steps_for_output_degrees(axis: int, degrees: float) -> int:
-    """Raw motor steps to command for a desired output-shaft rotation."""
+    """Raw protocol units to command for a desired output-shaft rotation:
+    motor steps for a stepper axis, servo position units for a servo axis."""
     return round(degrees / deg_per_step(axis))
+
+
+def max_jog_for_axis(axis: int) -> int:
+    """Largest single-jog magnitude this axis's protocol units allow —
+    MAX_JOG_STEPS for a stepper, the servo's full 0-1000 position range for
+    a servo axis."""
+    return SERVO_UNITS_PER_REV if AXIS_TYPE[axis] == "servo" else MAX_JOG_STEPS
 
 
 class LinkError(Exception):

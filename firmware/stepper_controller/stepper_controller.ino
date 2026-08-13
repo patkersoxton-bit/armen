@@ -1,10 +1,15 @@
 /*
- * Armen — Stepper Arm Controller
- * Target: Arduino Uno + CNC Shield V3 + DRV8825 drivers + NEMA 17 steppers
+ * Armen — Stepper + Bus Servo Arm Controller
+ * Target: Arduino Uno + CNC Shield V3, mixed axes:
+ *   X (base), Y (shoulder) — TMC2209 stepper drivers, NEMA 17 steppers
+ *   Z (elbow), A (spare)   — Hiwonder LX-16A bus servos over a BusLinker
+ *                            board (SoftwareSerial on D9/D10)
  *
- * Replaces the ESP32/PCA9685 servo firmware: the actual kit (parts.jpg) is a
- * CNC stepper stack, so control is open-loop step counting instead of servo
- * angles. Wiring and calibration procedure: see STEPPER_MIGRATION.md.
+ * Replaces the ESP32/PCA9685 servo firmware: the actual kit (parts.jpg) was
+ * originally a CNC stepper stack (open-loop step counting), later mixed
+ * with bus servos for two axes (closed-loop, absolute position). See
+ * AXIS_TYPE below for which axis is which, and STEPPER_MIGRATION.md /
+ * BusServo/LX16A_integration_notes.md for wiring and calibration.
  *
  * Protocol: newline-delimited JSON at 115200 baud, strict request/response.
  * The firmware prints exactly one JSON line per received command line and
@@ -18,40 +23,86 @@
  * Serial.print would otherwise freeze motion for ~10 ms per response and
  * cause audible stutter when the GUI polls during a jog.
  *
- * Position model (open loop — read this before trusting "pos"):
- *   - Positions are step counts relative to the pose where "zero" was last
- *     run. They are meaningless until zeroed and are lost whenever drivers
- *     are disabled or power is cycled (the arm can then be moved by hand).
- *   - Soft bounds (min/max steps per axis) are captured in calibration mode
- *     by jogging to each mechanical extreme and marking it, then saved to
- *     EEPROM. Bounds are only valid if "zero" is run at the same physical
- *     reference pose every session.
+ * Position model — differs by axis type (read this before trusting "pos"):
+ *   - Stepper axes (X, Y) are open loop: positions are step counts relative
+ *     to the pose where "zero" was last run. They are meaningless until
+ *     zeroed and are lost whenever drivers are disabled or power is cycled
+ *     (the arm can then be moved by hand).
+ *   - Servo axes (Z, A) are closed loop: "pos" is a live readback of the
+ *     LX-16A's own potentiometer (0-1000 = 0-240°), always meaningful, never
+ *     needs zeroing — "zero" is a no-op for these two axes.
+ *   - Soft bounds (per axis: raw motor steps for a stepper, 0-1000 servo
+ *     position units for a servo) are captured in calibration mode by
+ *     jogging to each mechanical extreme and marking it, then saved to
+ *     EEPROM. Stepper bounds are only valid if "zero" is run at the same
+ *     physical reference pose every session; servo bounds don't have that
+ *     caveat since their position is always absolute.
  *
  * Libraries (Arduino Library Manager):
  *   - AccelStepper
  *   - ArduinoJson 6.x (v7 also works but costs extra flash/RAM on the Uno)
+ *   - SoftwareSerial (bundled with the IDE)
+ *   - LX16A.h lives right next to this .ino (sketch-local, not installed as
+ *     a library) — keep the two files together if this sketch moves.
  */
 
 #include <AccelStepper.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
+#include <SoftwareSerial.h>
+#include "LX16A.h"
 
-#define FW_VERSION "stepper-0.4"
+#define FW_VERSION "stepper-0.5"
 #define BAUD_RATE 115200
 #define NUM_AXES 4
 
-// CNC Shield V3 pin map. The A axis requires the two jumpers next to the A
-// driver socket so A-STEP/A-DIR route to D12/D13.
-#define PIN_ENABLE 8  // shared driver enable, active LOW
+// CNC Shield V3 pin map. Only the X/Y driver sockets are populated now (Z/A
+// moved to bus servos, see AXIS_TYPE below) — the A-axis jumpers that used
+// to route A-STEP/A-DIR to D12/D13 are no longer needed.
+#define PIN_ENABLE 8  // shared driver enable (X/Y TMC2209 sockets), active LOW
 
-const uint8_t LIMIT_PINS[3] = {9, 10, 11};  // X, Y, Z endstop headers
+// Which control scheme each axis index uses. X/Y are still steppers; Z/A
+// are now Hiwonder LX-16A bus servos. This table gates every per-axis code
+// path below — keep it in sync with desktop_app/stepper_link.py's
+// AXIS_TYPE list, same as MAX_JOG_STEPS already has to be kept in sync.
+enum AxisKind { AXIS_STEPPER, AXIS_SERVO };
+const AxisKind AXIS_TYPE[NUM_AXES] = {AXIS_STEPPER, AXIS_STEPPER, AXIS_SERVO, AXIS_SERVO};
 
+// Physical LX-16A servo ID for each axis (unused/0 for stepper axes).
+// Verify against whatever IDs were actually assigned via Hiwonder's Bus
+// Servo Terminal app before trusting this mapping.
+const uint8_t SERVO_ID[NUM_AXES] = {0, 0, 1, 2};
+
+// Servo bus UART. D9/D10 are the CNC Shield's spare X+/Y+ endstop-header
+// breakouts (formerly read as LIMIT_PINS, now removed — no switch was ever
+// physically wired to them) — unrelated to the fact that X/Y remain
+// steppers, they were just the nearest already-broken-out free digital
+// pins. X+ carries the servo bus's TX (servo -> Arduino: RX here), Y+
+// carries the Arduino's TX (Arduino -> servo bus's RX).
+SoftwareSerial busPort(9, 10);  // RX, TX
+LX16ABus servos(busPort);
+
+const uint16_t SERVO_JOG_TIME_MS = 250;   // quick nudge, not a big move
+const uint16_t SERVO_MOVE_BASE_MS = 500;  // baseline for cmdMove's speed heuristic
+
+// AccelStepper objects exist for all 4 slots so nothing else here needs to
+// special-case array indices, but indices 2/3 (Z, A) are inert placeholders
+// now that those axes are servos — AXIS_TYPE gates out any .run()/.moveTo()/
+// .setCurrentPosition() call that would otherwise touch them.
 AccelStepper steppers[NUM_AXES] = {
   AccelStepper(AccelStepper::DRIVER, 2, 5),   // X: STEP D2, DIR D5
   AccelStepper(AccelStepper::DRIVER, 3, 6),   // Y: STEP D3, DIR D6
-  AccelStepper(AccelStepper::DRIVER, 4, 7),   // Z: STEP D4, DIR D7
-  AccelStepper(AccelStepper::DRIVER, 12, 13)  // A: STEP D12, DIR D13
+  AccelStepper(AccelStepper::DRIVER, 4, 7),   // Z: unused, was STEP D4, DIR D7
+  AccelStepper(AccelStepper::DRIVER, 12, 13)  // A: unused, was STEP D12, DIR D13
 };
+
+// Firmware-side bookkeeping of each servo axis's last commanded position
+// (0-1000), analogous to AccelStepper::currentPosition() for steppers.
+// Used as the baseline for relative jogs so jogging stays fast (no blocking
+// readPosition() round-trip before every click); get_state and mark still
+// query the servo's real measured position via readPosition() for
+// authoritative values.
+long lastServoPos[NUM_AXES] = {0, 0, 500, 500};
 
 // Motion tuning, in steps. Boot defaults are deliberately conservative so
 // they are sane in ANY microstep mode — 500 steps/s is 2.5 rev/s even in
@@ -98,17 +149,16 @@ char outBuf[288];
 
 void setup() {
   Serial.begin(BAUD_RATE);
+  busPort.begin(115200);
 
   pinMode(PIN_ENABLE, OUTPUT);
-  digitalWrite(PIN_ENABLE, HIGH);  // drivers off until explicitly enabled
-
-  for (uint8_t i = 0; i < 3; i++) {
-    pinMode(LIMIT_PINS[i], INPUT_PULLUP);
-  }
+  digitalWrite(PIN_ENABLE, HIGH);  // X/Y drivers off until explicitly enabled
 
   for (uint8_t i = 0; i < NUM_AXES; i++) {
-    steppers[i].setMaxSpeed(maxSpeedSteps);
-    steppers[i].setAcceleration(accelSteps);
+    if (AXIS_TYPE[i] == AXIS_STEPPER) {
+      steppers[i].setMaxSpeed(maxSpeedSteps);
+      steppers[i].setAcceleration(accelSteps);
+    }
     markedMin[i] = false;
     markedMax[i] = false;
   }
@@ -123,7 +173,7 @@ void loop() {
 
 void runSteppers() {
   for (uint8_t i = 0; i < NUM_AXES; i++) {
-    steppers[i].run();
+    if (AXIS_TYPE[i] == AXIS_STEPPER) steppers[i].run();
   }
 }
 
@@ -198,6 +248,7 @@ void cmdPing() {
 
 void cmdEnable() {
   digitalWrite(PIN_ENABLE, LOW);
+  setServoLoads(true);
   motorsEnabled = true;
   sendOk("enable", F("drivers enabled"));
 }
@@ -205,11 +256,20 @@ void cmdEnable() {
 void cmdDisable() {
   haltAll();
   digitalWrite(PIN_ENABLE, HIGH);
+  setServoLoads(false);
   motorsEnabled = false;
   // Without holding torque the arm can move (or fall!) — step counts are
-  // no longer trustworthy.
+  // no longer trustworthy. (Servo axes don't lose their position reference
+  // this way — they always know their absolute angle — but they do lose
+  // holding torque just like the steppers.)
   referenced = false;
   sendOk("disable", F("drivers disabled; position reference lost"));
+}
+
+void setServoLoads(bool on) {
+  for (uint8_t i = 0; i < NUM_AXES; i++) {
+    if (AXIS_TYPE[i] == AXIS_SERVO) servos.setLoad(SERVO_ID[i], on);
+  }
 }
 
 void cmdZero() {
@@ -218,7 +278,9 @@ void cmdZero() {
     return;
   }
   for (uint8_t i = 0; i < NUM_AXES; i++) {
-    steppers[i].setCurrentPosition(0);
+    // Servo axes have nothing to zero — their position is always absolute
+    // (read from the servo's own potentiometer), unlike open-loop steppers.
+    if (AXIS_TYPE[i] == AXIS_STEPPER) steppers[i].setCurrentPosition(0);
     markedMin[i] = false;
     markedMax[i] = false;
   }
@@ -263,11 +325,23 @@ void cmdJog(JsonDocument& doc) {
     sendErr("jog", F("axis must be 0-3"));
     return;
   }
-  if (steps == 0 || steps > MAX_JOG_STEPS || steps < -MAX_JOG_STEPS) {
-    sendErr("jog", F("steps must be non-zero and within +/-500000"));
+  // "steps" means raw motor steps for a stepper axis, servo position units
+  // (0-1000 full range) for a servo axis — the ceiling scales accordingly.
+  long ceiling = (AXIS_TYPE[axis] == AXIS_SERVO) ? 1000L : MAX_JOG_STEPS;
+  if (steps == 0 || steps > ceiling || steps < -ceiling) {
+    sendErr("jog", F("steps must be non-zero and within the axis's jog ceiling"));
     return;
   }
-  steppers[axis].move(steps);
+  if (AXIS_TYPE[axis] == AXIS_SERVO) {
+    long target = constrain(lastServoPos[axis] + steps, 0L, 1000L);
+    if (cal.minBound[axis] != cal.maxBound[axis]) {
+      target = constrain(target, cal.minBound[axis], cal.maxBound[axis]);
+    }
+    servos.move(SERVO_ID[axis], (uint16_t)target, SERVO_JOG_TIME_MS);
+    lastServoPos[axis] = target;
+  } else {
+    steppers[axis].move(steps);
+  }
   sendOk("jog", F("jogging"));
 }
 
@@ -290,7 +364,18 @@ void cmdMark(JsonDocument& doc) {
     sendErr("mark", F("need axis 0-3 and which:min|max"));
     return;
   }
-  long pos = steppers[axis].currentPosition();
+  long pos;
+  if (AXIS_TYPE[axis] == AXIS_SERVO) {
+    int16_t measured;
+    if (!servos.readPosition(SERVO_ID[axis], &measured)) {
+      sendErr("mark", F("servo did not respond; check wiring/ID"));
+      return;
+    }
+    pos = measured;
+    lastServoPos[axis] = pos;  // the real readback is authoritative
+  } else {
+    pos = steppers[axis].currentPosition();
+  }
   bool isMin;
   if (strcmp(which, "min") == 0) {
     cal.minBound[axis] = pos;
@@ -366,8 +451,18 @@ void cmdMove(JsonDocument& doc) {
     if (cal.minBound[i] != cal.maxBound[i]) {
       t = constrain(t, cal.minBound[i], cal.maxBound[i]);
     }
-    steppers[i].setMaxSpeed(maxSpeedSteps * speed);
-    steppers[i].moveTo(t);
+    if (AXIS_TYPE[i] == AXIS_SERVO) {
+      t = constrain(t, 0L, 1000L);
+      // Simple heuristic scaling move time by the speed field — a starting
+      // point to tune once this is driving real hardware, not a precise
+      // distance/velocity model like the stepper side gets from AccelStepper.
+      uint16_t timeMs = (uint16_t)constrain((long)(SERVO_MOVE_BASE_MS / speed), 200L, 4000L);
+      servos.move(SERVO_ID[i], (uint16_t)t, timeMs);
+      lastServoPos[i] = t;
+    } else {
+      steppers[i].setMaxSpeed(maxSpeedSteps * speed);
+      steppers[i].moveTo(t);
+    }
   }
   sendOk("move", F("moving (bounded axes clamped)"));
 }
@@ -378,8 +473,10 @@ void cmdSetMotion(JsonDocument& doc) {
   maxSpeedSteps = constrain(ms, 100.0f, 4000.0f);
   accelSteps = constrain(ac, 100.0f, 20000.0f);
   for (uint8_t i = 0; i < NUM_AXES; i++) {
-    steppers[i].setMaxSpeed(maxSpeedSteps);
-    steppers[i].setAcceleration(accelSteps);
+    if (AXIS_TYPE[i] == AXIS_STEPPER) {
+      steppers[i].setMaxSpeed(maxSpeedSteps);
+      steppers[i].setAcceleration(accelSteps);
+    }
   }
   char idStr[16];
   idField(idStr, sizeof(idStr));
@@ -451,20 +548,33 @@ void sendErr(const char* cmd, const __FlashStringHelper* err) {
   sendBuffered();
 }
 
+// Current position for get_state: a live-queried readback for servo axes
+// (falls back to the last commanded position if the servo doesn't answer,
+// so a transient bus hiccup doesn't break the whole status response), or
+// AccelStepper's tracked step count for stepper axes.
+long axisPos(uint8_t i) {
+  if (AXIS_TYPE[i] == AXIS_SERVO) {
+    int16_t measured;
+    if (servos.readPosition(SERVO_ID[i], &measured)) {
+      lastServoPos[i] = measured;
+    }
+    return lastServoPos[i];
+  }
+  return steppers[i].currentPosition();
+}
+
 void sendState() {
   char idStr[16];
   idField(idStr, sizeof(idStr));
+  long pos[NUM_AXES];
+  for (uint8_t i = 0; i < NUM_AXES; i++) pos[i] = axisPos(i);
   snprintf_P(outBuf, sizeof(outBuf),
              PSTR("{\"cmd\":\"get_state\",\"status\":\"ok\"%s,\"state\":\"%S\","
                   "\"enabled\":%S,\"referenced\":%S,\"calibrated\":%S,\"moving\":%S,"
-                  "\"pos\":[%ld,%ld,%ld,%ld],\"limits\":[%S,%S,%S]}"),
+                  "\"pos\":[%ld,%ld,%ld,%ld]}"),
              idStr, (PGM_P)stateName(),
              bstr(motorsEnabled), bstr(referenced), bstr(calibrated), bstr(anyMoving()),
-             steppers[0].currentPosition(), steppers[1].currentPosition(),
-             steppers[2].currentPosition(), steppers[3].currentPosition(),
-             bstr(digitalRead(LIMIT_PINS[0]) == LOW),   // pressed pulls to GND
-             bstr(digitalRead(LIMIT_PINS[1]) == LOW),
-             bstr(digitalRead(LIMIT_PINS[2]) == LOW));
+             pos[0], pos[1], pos[2], pos[3]);
   sendBuffered();
 }
 
@@ -503,8 +613,11 @@ bool anyMoving() {
 void haltAll() {
   // setCurrentPosition() zeroes speed and makes the current position the
   // target — an immediate stop that keeps the step reference intact.
+  // Servo axes have no continuous in-flight motion this can interrupt (each
+  // move/jog is already a bounded, timed command); estop does not attempt
+  // to cut a servo move short mid-flight.
   for (uint8_t i = 0; i < NUM_AXES; i++) {
-    steppers[i].setCurrentPosition(steppers[i].currentPosition());
+    if (AXIS_TYPE[i] == AXIS_STEPPER) steppers[i].setCurrentPosition(steppers[i].currentPosition());
   }
 }
 

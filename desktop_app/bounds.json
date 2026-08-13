@@ -5,20 +5,20 @@
     {
       "axis": 0,
       "name": "X (base)",
-      "gear_ratio": 37.0,
-      "min": -30529,
-      "max": 33300,
-      "min_deg": -92.82466216216217,
-      "max_deg": 101.25
+      "gear_ratio": 10.0,
+      "min": -5085,
+      "max": 5657,
+      "min_deg": -57.20625,
+      "max_deg": 63.64125
     },
     {
       "axis": 1,
       "name": "Y (shoulder)",
       "gear_ratio": 1.0,
-      "min": 0,
-      "max": 0,
-      "min_deg": 0.0,
-      "max_deg": 0.0
+      "min": 2033,
+      "max": -2617,
+      "min_deg": 228.7125,
+      "max_deg": -294.4125
     },
     {
       "axis": 2,

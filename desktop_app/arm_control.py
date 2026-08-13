@@ -6,11 +6,20 @@ Reads the bounds saved in the Uno's EEPROM and builds matching controls:
     nudge buttons; targets are clamped in the UI *and* by the firmware.
   - Free axes (min == max in EEPROM, for continuous-rotation joints with no
     mechanical limit) get unlimited jog buttons instead of a slider. The
-    base (X) used to be treated as free pre-gearbox; after the 37:1 gearbox
-    it likely has real bounds instead — don't assume either way, check what
-    calibrate.py actually saved.
+    base (X) used to be treated as free pre-gearbox; after gearing (first a
+    37:1 unit, now swapped for a 10:1 metal orbital gear) it likely has real
+    bounds instead — don't assume either way, check what calibrate.py
+    actually saved.
 
-Power-up ritual (open-loop steppers — positions mean nothing until zeroed):
+Mixed axis types (X/Y steppers, Z/A LX-16A bus servos — see
+stepper_link.AXIS_TYPE): the slider/nudge/free-jog UI above works the same
+for both, since deg_per_step()/bounds are generic per axis. The one thing
+that differs is *why* zeroing matters: X/Y are open-loop steppers whose
+position means nothing until zeroed at a repeatable reference pose; Z/A are
+closed-loop servos that always know their absolute angle and don't need
+zeroing at all (the firmware treats "zero" as a no-op for them).
+
+Power-up ritual (matters for the X/Y stepper axes; harmless no-op for Z/A):
   pose arm at reference -> Connect -> Enable -> Zero Here -> drive.
 """
 
