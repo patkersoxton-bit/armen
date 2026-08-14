@@ -1,28 +1,21 @@
 {
-  "note": "Step bounds relative to the reference (zero) pose. Only valid when the arm is zeroed at that same pose. min/max are raw motor steps; min_deg/max_deg are output-shaft degrees after applying gear_ratio.",
+  "note": "Bounds relative to the reference (zero) pose for stepper axes (X/Y); servo axes (Z/A) don't need a reference pose, their position is always absolute. min/max are raw protocol units \u2014 motor steps for a stepper axis, servo position units (0-1000) for a servo axis; min_deg/max_deg are output-shaft degrees (via gear_ratio for steppers, a fixed 0.24\u00b0/unit for servos).",
   "steps_per_rev": 3200,
   "axes": [
     {
       "axis": 0,
       "name": "X (base)",
+      "axis_type": "stepper",
       "gear_ratio": 10.0,
-      "min": -5085,
-      "max": 5657,
-      "min_deg": -57.20625,
-      "max_deg": 63.64125
+      "min": -4800,
+      "max": 4485,
+      "min_deg": -54.0,
+      "max_deg": 50.45625
     },
     {
       "axis": 1,
       "name": "Y (shoulder)",
-      "gear_ratio": 1.0,
-      "min": 2033,
-      "max": -2617,
-      "min_deg": 228.7125,
-      "max_deg": -294.4125
-    },
-    {
-      "axis": 2,
-      "name": "Z (elbow)",
+      "axis_type": "stepper",
       "gear_ratio": 1.0,
       "min": 0,
       "max": 0,
@@ -30,9 +23,20 @@
       "max_deg": 0.0
     },
     {
+      "axis": 2,
+      "name": "Z (elbow)",
+      "axis_type": "servo",
+      "gear_ratio": null,
+      "min": 0,
+      "max": 0,
+      "min_deg": 0.0,
+      "max_deg": 0.0
+    },
+    {
       "axis": 3,
-      "name": "A (wrist)",
-      "gear_ratio": 1.0,
+      "name": "A (spare)",
+      "axis_type": "servo",
+      "gear_ratio": null,
       "min": 0,
       "max": 0,
       "min_deg": 0.0,
